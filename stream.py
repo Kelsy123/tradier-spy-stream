@@ -1,3 +1,5 @@
+print("✅ stream.py starting up...", flush=True)
+
 import asyncio
 import json
 from datetime import date, timedelta
