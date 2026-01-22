@@ -196,7 +196,7 @@ async def run():
                 if outside_prev_by_phantom and (now - last_phantom_alert_ts >= PHANTOM_COOLDOWN_SEC):
                     last_phantom_alert_ts = now
                     print(
-                        f"🚨🚨 {ts_str()} PHANTOM PRINT DETECTED: ${last} size={size} "
+                        f"🚨🚨 {ts_str()} OUTSIDE PREV RANGE: ${last} size={size} "
                         f"prev_range=[{prev_low}, {prev_high}] session={sess}",
                         flush=True
                     )
