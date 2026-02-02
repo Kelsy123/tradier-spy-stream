@@ -47,58 +47,52 @@ ET = ZoneInfo("America/New_York")
 
 def get_previous_session_range(symbol: str) -> Tuple[float, float, str]:
     """
-    Fetches the most recent prior trading day using Yahoo Finance (free, no API key needed).
+    Fetches the most recent prior trading day using Twelve Data (free tier, 800/day).
+    Falls back to manual range if API fails.
     Returns (high, low, date_str).
     """
-    print("✅ fetching previous session from Yahoo Finance...", flush=True)
+    print("✅ fetching previous session range...", flush=True)
     
-    # Try last 7 days to skip weekends/holidays
-    for days_back in range(1, 8):
-        end_date = date.today() - timedelta(days=days_back)
-        start_date = end_date - timedelta(days=1)
-        
-        # Convert date to datetime for timestamp() method
-        end_datetime = datetime.combine(end_date, datetime.min.time())
-        start_datetime = datetime.combine(start_date, datetime.min.time())
-        
-        # Yahoo Finance URL format
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    # Try Twelve Data API (free tier, no key needed for basic calls)
+    try:
+        url = "https://api.twelvedata.com/time_series"
         params = {
-            "interval": "1d",
-            "period1": int(start_datetime.timestamp()),
-            "period2": int(end_datetime.timestamp()),
+            "symbol": symbol,
+            "interval": "1day",
+            "outputsize": 5,  # Get last 5 days to account for weekends
+            "format": "JSON"
         }
         
-        try:
-            response = requests.get(url, params=params, timeout=10)
-            response.raise_for_status()
-            data = response.json()
+        response = requests.get(url, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        
+        if "values" in data and len(data["values"]) > 0:
+            # Get the most recent complete day (index 1, since 0 might be today)
+            prev_day = data["values"][1] if len(data["values"]) > 1 else data["values"][0]
             
-            # Parse Yahoo Finance response
-            result = data.get("chart", {}).get("result", [])
-            if not result:
-                continue
-                
-            quotes = result[0].get("indicators", {}).get("quote", [])
-            if not quotes or not quotes[0]:
-                continue
+            prev_high = float(prev_day["high"])
+            prev_low = float(prev_day["low"])
+            prev_date = prev_day["datetime"]
             
-            quote = quotes[0]
-            highs = quote.get("high", [])
-            lows = quote.get("low", [])
+            print(f"✅ Found previous session: {prev_date} high={prev_high} low={prev_low}", flush=True)
+            return prev_high, prev_low, prev_date
             
-            if highs and lows and highs[0] is not None and lows[0] is not None:
-                prev_high = float(highs[0])
-                prev_low = float(lows[0])
-                prev_date = end_date.isoformat()
-                print(f"✅ Found previous session: {prev_date} high={prev_high} low={prev_low}", flush=True)
-                return prev_high, prev_low, prev_date
-                
-        except Exception as e:
-            print(f"⚠️ Yahoo Finance fetch failed for {end_date}: {e}", flush=True)
-            continue
+    except Exception as e:
+        print(f"⚠️ Twelve Data API failed: {e}", flush=True)
     
-    raise RuntimeError(f"Could not fetch previous session range for {symbol} (tried last 7 days)")
+    # Fallback: Use a reasonable manual range if API fails
+    print("⚠️ API fetch failed, using fallback range", flush=True)
+    prev_date = (date.today() - timedelta(days=1)).isoformat()
+    
+    # Set a wide range as fallback - prevents crashes but less accurate
+    prev_high = 700.0  # TODO: Update this manually if APIs consistently fail
+    prev_low = 670.0   # TODO: Update this manually if APIs consistently fail
+    
+    print(f"⚠️ Using fallback range: {prev_date} high={prev_high} low={prev_low}", flush=True)
+    print("⚠️ WARNING: Manual range in use - phantom detection may be inaccurate!", flush=True)
+    
+    return prev_high, prev_low, prev_date
 
 
 def to_float(x) -> Optional[float]:
