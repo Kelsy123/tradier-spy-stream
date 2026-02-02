@@ -33,6 +33,24 @@ ENABLE_WATCH = False
 WATCH_PRICES = []  # Add specific prices like [670.29] if needed
 WATCH_TOLERANCE = 0.02  # 2 cents
 
+# -------------------------
+# Trade filtering options
+# -------------------------
+# Log ALL trades for debugging (set to True to see every trade)
+LOG_ALL_TRADES = False
+
+# Suspicious trade conditions to flag (from Massive's glossary)
+# These often indicate irregular trades that might be phantoms
+SUSPICIOUS_CONDITIONS = {
+    14,  # Odd lot trade
+    37,  # Intermarket sweep
+    41,  # Derivatively priced
+}
+
+# Alert on unusual trade sizes
+MIN_SUSPICIOUS_SIZE = 1      # Trades smaller than this
+MAX_SUSPICIOUS_SIZE = 50000  # Trades larger than this
+
 # =========================
 # Massive.io API Configuration
 # =========================
@@ -47,50 +65,54 @@ ET = ZoneInfo("America/New_York")
 
 def get_previous_session_range(symbol: str) -> Tuple[float, float, str]:
     """
-    Fetches the most recent prior trading day using Twelve Data (free tier, 800/day).
+    Fetches the most recent prior trading day from Massive's own API.
     Falls back to manual range if API fails.
     Returns (high, low, date_str).
     """
-    print("✅ fetching previous session range...", flush=True)
+    print("✅ fetching previous session range from Massive API...", flush=True)
     
-    # Try Twelve Data API (free tier, no key needed for basic calls)
+    # Try Massive's aggregates endpoint for previous day
     try:
-        url = "https://api.twelvedata.com/time_series"
-        params = {
-            "symbol": symbol,
-            "interval": "1day",
-            "outputsize": 5,  # Get last 5 days to account for weekends
-            "format": "JSON"
-        }
+        # Get data for last 5 days to ensure we get a complete trading day
+        end_date = date.today()
+        start_date = end_date - timedelta(days=5)
         
-        response = requests.get(url, params=params, timeout=10)
-        response.raise_for_status()
-        data = response.json()
+        url = f"https://api.massive.io/v1/stocks/aggregates/{symbol}/range/1/day/{start_date.isoformat()}/{end_date.isoformat()}"
+        headers = {"Authorization": f"Bearer {MASSIVE_API_KEY}"}
         
-        if "values" in data and len(data["values"]) > 0:
-            # Get the most recent complete day (index 1, since 0 might be today)
-            prev_day = data["values"][1] if len(data["values"]) > 1 else data["values"][0]
+        response = requests.get(url, headers=headers, timeout=10)
+        
+        if response.status_code == 200:
+            data = response.json()
+            results = data.get("results", [])
             
-            prev_high = float(prev_day["high"])
-            prev_low = float(prev_day["low"])
-            prev_date = prev_day["datetime"]
-            
-            print(f"✅ Found previous session: {prev_date} high={prev_high} low={prev_low}", flush=True)
-            return prev_high, prev_low, prev_date
-            
+            # Get the second-to-last day (most recent complete day)
+            if len(results) >= 2:
+                prev_day = results[-2]  # -1 might be today (incomplete), so use -2
+                prev_high = float(prev_day["h"])
+                prev_low = float(prev_day["l"])
+                prev_timestamp = prev_day["t"]
+                prev_date = datetime.fromtimestamp(prev_timestamp / 1000).strftime("%Y-%m-%d")
+                
+                print(f"✅ Found previous session: {prev_date} high={prev_high} low={prev_low}", flush=True)
+                return prev_high, prev_low, prev_date
+                
+        print(f"⚠️ Massive API returned status {response.status_code}", flush=True)
+                
     except Exception as e:
-        print(f"⚠️ Twelve Data API failed: {e}", flush=True)
+        print(f"⚠️ Massive API fetch failed: {e}", flush=True)
     
-    # Fallback: Use a reasonable manual range if API fails
-    print("⚠️ API fetch failed, using fallback range", flush=True)
+    # Fallback: Use current SPY approximate range based on recent trading
+    print("⚠️ API fetch failed, using conservative fallback range", flush=True)
     prev_date = (date.today() - timedelta(days=1)).isoformat()
     
-    # Set a wide range as fallback - prevents crashes but less accurate
-    prev_high = 700.0  # TODO: Update this manually if APIs consistently fail
-    prev_low = 670.0   # TODO: Update this manually if APIs consistently fail
+    # Based on current market conditions (SPY ~692), set reasonable bounds
+    # These are intentionally wide to avoid false positives
+    prev_high = 695.0  # Update manually if needed
+    prev_low = 685.0   # Update manually if needed
     
     print(f"⚠️ Using fallback range: {prev_date} high={prev_high} low={prev_low}", flush=True)
-    print("⚠️ WARNING: Manual range in use - phantom detection may be inaccurate!", flush=True)
+    print("⚠️ WARNING: Manual range in use - update these values or fix API!", flush=True)
     
     return prev_high, prev_low, prev_date
 
@@ -152,7 +174,7 @@ async def run():
             events = data if isinstance(data, list) else [data]
             
             for event in events:
-                # Massive trade format: {"ev":"T","sym":"SPY","p":686.50,"s":100,"t":1234567890000}
+                # Massive trade format: {"ev":"T","sym":"SPY","p":686.50,"s":100,"t":1234567890000,"c":[...]}
                 if event.get("ev") != "T":  # T = Trade
                     continue
                 
@@ -162,7 +184,24 @@ async def run():
                 
                 size = event.get("s", 0)  # size
                 timestamp = event.get("t", 0)  # timestamp in milliseconds
+                conditions = event.get("c", [])  # trade conditions
+                exchange = event.get("x")  # exchange ID
                 now = time_module.time()
+                
+                # Log trade details for debugging
+                if LOG_ALL_TRADES:
+                    print(f"📊 Trade: ${last} size={size} conditions={conditions} exchange={exchange}", flush=True)
+                
+                # Flag suspicious trade characteristics
+                has_suspicious_condition = any(c in SUSPICIOUS_CONDITIONS for c in conditions)
+                has_unusual_size = size < MIN_SUSPICIOUS_SIZE or size > MAX_SUSPICIOUS_SIZE
+                
+                if has_suspicious_condition or has_unusual_size:
+                    print(
+                        f"⚠️ {ts_str()} UNUSUAL TRADE: ${last} size={size} "
+                        f"conditions={conditions} exchange={exchange}",
+                        flush=True
+                    )
                 
                 # Determine if this is regular trading hours (9:30 AM - 4:00 PM ET)
                 trade_time = datetime.fromtimestamp(timestamp / 1000, tz=ET)
@@ -202,7 +241,8 @@ async def run():
                     last_phantom_alert_ts = now
                     print(
                         f"🚨🚨 {ts_str()} PHANTOM PRINT DETECTED: ${last} size={size} "
-                        f"prev_range=[{prev_low}, {prev_high}] rth_range=[{rth_low}, {rth_high}]",
+                        f"prev_range=[{prev_low}, {prev_high}] rth_range=[{rth_low}, {rth_high}] "
+                        f"conditions={conditions} exchange={exchange}",
                         flush=True
                     )
 
