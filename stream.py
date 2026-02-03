@@ -80,16 +80,18 @@ def fetch_prev_day_range_tradier(symbol, tradier_api_key):
         "Accept": "application/json"
     }
     r = requests.get(url, params=params, headers=headers)
+    print("Tradier raw response:", r.text)  # For debugging
     if r.status_code == 200:
         data = r.json()
         day = data.get("history", {}).get("day", [])
-        if day:
+        if isinstance(day, list) and len(day) > 0:
             low = float(day[0]["low"])
             high = float(day[0]["high"])
             print(f"➡️ Previous day range from Tradier: low={low} high={high}", flush=True)
             return low, high
         else:
-            print("⚠️ No data returned from Tradier", flush=True)
+            print("⚠️ No data returned from Tradier for previous day. Using fallback.", flush=True)
+            # Fallback values (set to None or reasonable defaults)
             return None, None
     else:
         print(f"⚠️ Tradier fetch error {r.status_code}: {r.text}", flush=True)
@@ -139,7 +141,12 @@ async def run():
 
     # Get previous day's full session range from Tradier
     prev_low, prev_high = fetch_prev_day_range_tradier(SYMBOL, TRADIER_API_KEY)
-    print(f"📌 Previous day range: low={prev_low} high={prev_high}", flush=True)
+    if prev_low is None or prev_high is None:
+        # Set fallback values or skip phantom detection until valid data is available
+        prev_low, prev_high = 0, 1000  # Example fallback, adjust as needed
+        print(f"⚠️ Using fallback previous day range: low={prev_low} high={prev_high}", flush=True)
+    else:
+        print(f"📌 Previous day range: low={prev_low} high={prev_high}", flush=True)
 
     # Initialize today's session ranges
     today_low, today_high = None, None
@@ -272,15 +279,16 @@ async def run():
                             print("⏳ (suppressed due to cooldown)", flush=True)
                     # RTH breakout logic (optional, can be adapted for other sessions)
                     if time(9,30) <= tm < time(16,0) and not bad_conditions:
-                        if price > rth_high + RTH_BREAK_BUFFER or price < rth_low - RTH_BREAK_BUFFER:
-                            if not is_phantom and now - last_rth_alert > RTH_COOLDOWN:
-                                last_rth_alert = now
-                                print(
-                                    f"🚨 BREAKOUT {ts_str()} ${price} "
-                                    f"size={size} conds={conds} exch={exch} "
-                                    f"rth=[{rth_low},{rth_high}]",
-                                    flush=True
-                                )
+                        if rth_high is not None and rth_low is not None:
+                            if price > rth_high + RTH_BREAK_BUFFER or price < rth_low - RTH_BREAK_BUFFER:
+                                if not is_phantom and now - last_rth_alert > RTH_COOLDOWN:
+                                    last_rth_alert = now
+                                    print(
+                                        f"🚨 BREAKOUT {ts_str()} ${price} "
+                                        f"size={size} conds={conds} exch={exch} "
+                                        f"rth=[{rth_low},{rth_high}]",
+                                        flush=True
+                                    )
         except Exception as e:
             print(f"⚠️ Websocket closed: {e}", flush=True)
             print("🔁 Reconnecting…", flush=True)
