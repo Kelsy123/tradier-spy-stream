@@ -20,6 +20,10 @@ POSTGRES_URL = os.environ["POSTGRES_URL"]
 DISCORD_WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
 TRADIER_API_KEY = os.environ["TRADIER_API_KEY"]
 
+# Manual previous day range override (set these to use your values, set to None to use API)
+MANUAL_PREV_LOW = None   # Example: 681.76
+MANUAL_PREV_HIGH = None  # Example: 691.90
+
 # Phantom thresholds
 PHANTOM_OUTSIDE_PREV = 0.10
 PHANTOM_GAP_FROM_CURRENT = 0.25  # Fixed 25 cent gap from current day's range
@@ -41,7 +45,7 @@ IGNORE_CONDITIONS = {
     0, 14, 4, 9, 19, 53, 1
 }
 PHANTOM_RELEVANT_CONDITIONS = {
-    2, 3, 7, 8, 10, 12, 13, 15, 16, 17, 20, 21, 22, 25, 26, 28, 29, 30, 33, 34, 37, 62
+    2, 3, 7, 8, 10, 12, 13, 15, 16, 17, 20, 21, 22, 25, 26, 28, 29, 30, 33, 34, 37, 41, 62
 }
 
 # ======================================================
@@ -202,17 +206,23 @@ async def init_postgres():
 # MAIN
 # ======================================================
 async def run():
-    # Fetch previous day range
-    prev_low, prev_high = fetch_prev_day_range_tradier(SYMBOL, TRADIER_API_KEY)
-    
-    if prev_low is None or prev_high is None:
-        prev_low, prev_high = fetch_prev_day_range_massive(SYMBOL, MASSIVE_API_KEY)
-    
-    if prev_low is None or prev_high is None:
-        print("❌ FATAL: Could not fetch previous day range from any source", flush=True)
-        return
-    
-    print(f"📊 Using previous day range: low={prev_low}, high={prev_high}", flush=True)
+    # Check for manual override first
+    if MANUAL_PREV_LOW is not None and MANUAL_PREV_HIGH is not None:
+        prev_low = MANUAL_PREV_LOW
+        prev_high = MANUAL_PREV_HIGH
+        print(f"📊 Using MANUAL previous day range: low={prev_low}, high={prev_high}", flush=True)
+    else:
+        # Fetch previous day range from APIs
+        prev_low, prev_high = fetch_prev_day_range_tradier(SYMBOL, TRADIER_API_KEY)
+        
+        if prev_low is None or prev_high is None:
+            prev_low, prev_high = fetch_prev_day_range_massive(SYMBOL, MASSIVE_API_KEY)
+        
+        if prev_low is None or prev_high is None:
+            print("❌ FATAL: Could not fetch previous day range from any source", flush=True)
+            return
+        
+        print(f"📊 Using API previous day range: low={prev_low}, high={prev_high}", flush=True)
     
     # Connect to Postgres
     db = await init_postgres()
