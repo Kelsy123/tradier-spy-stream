@@ -485,30 +485,35 @@ async def run():
                         
                         now = time_module.time()
 
-                        # NOW update today's full session range (after phantom check)
-                        if today_low is None or price < today_low:
-                            today_low = price
-                        if today_high is None or price > today_high:
-                            today_high = price
+                        # ====================================================================
+                        # UPDATE RANGES - Only for non-phantom trades
+                        # Phantom prints shouldn't pollute the real trading range
+                        # ====================================================================
+                        if not is_phantom:
+                            # Update today's full session range
+                            if today_low is None or price < today_low:
+                                today_low = price
+                            if today_high is None or price > today_high:
+                                today_high = price
 
-                        # Update session-specific ranges
-                        if in_premarket:
-                            if premarket_low is None or price < premarket_low:
-                                premarket_low = price
-                            if premarket_high is None or price > premarket_high:
-                                premarket_high = price
-                                
-                        elif in_rth:
-                            if rth_low is None or price < rth_low:
-                                rth_low = price
-                            if rth_high is None or price > rth_high:
-                                rth_high = price
-                                
-                        elif in_afterhours:
-                            if afterhours_low is None or price < afterhours_low:
-                                afterhours_low = price
-                            if afterhours_high is None or price > afterhours_high:
-                                afterhours_high = price
+                            # Update session-specific ranges
+                            if in_premarket:
+                                if premarket_low is None or price < premarket_low:
+                                    premarket_low = price
+                                if premarket_high is None or price > premarket_high:
+                                    premarket_high = price
+                                    
+                            elif in_rth:
+                                if rth_low is None or price < rth_low:
+                                    rth_low = price
+                                if rth_high is None or price > rth_high:
+                                    rth_high = price
+                                    
+                            elif in_afterhours:
+                                if afterhours_low is None or price < afterhours_low:
+                                    afterhours_low = price
+                                if afterhours_high is None or price > afterhours_high:
+                                    afterhours_high = price
 
                         # ====================================================================
                         # VELOCITY DIVERGENCE TRACKING
