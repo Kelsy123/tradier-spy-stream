@@ -470,6 +470,9 @@ async def run():
                         # Increment trade counter for initial range establishment
                         initial_trades_count += 1
 
+                        # Filter out bad conditions (needed by multiple detection systems)
+                        bad_conditions = any(c in IGNORE_CONDITIONS for c in conds)
+
                         # ====================================================================
                         # VELOCITY DIVERGENCE TRACKING
                         # Track trades in rolling windows, detect when velocity drops at extremes
@@ -550,9 +553,6 @@ async def run():
                                         # Reset confirmation counter if divergence not detected
                                         velocity_confirmation_count = 0
 
-                        # Filter out bad conditions
-                        bad_conditions = any(c in IGNORE_CONDITIONS for c in conds)
-                        
                         phantom_cond_ok = (
                             any(c in PHANTOM_RELEVANT_CONDITIONS for c in conds)
                             and not bad_conditions
