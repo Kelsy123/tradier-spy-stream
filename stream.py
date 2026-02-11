@@ -7,8 +7,10 @@ import asyncpg
 import aiohttp
 from datetime import datetime, date, timedelta, time
 from zoneinfo import ZoneInfo
-from collections import deque
+from collections import deque, defaultdict
 import time as time_module
+import csv
+from pathlib import Path
 
 # ======================================================
 # SETTINGS
@@ -65,6 +67,9 @@ RTH_BREAK_BUFFER = 0.10
 # Debug
 LOG_ALL_TRADES = False
 
+# Zero-size trade logging
+ZERO_SIZE_LOGGING_ENABLED = os.environ.get("ZERO_SIZE_LOGGING", "true").lower() in ("true", "1", "yes")
+
 # ======================================================
 # SIP CONDITION FILTERING
 # ======================================================
@@ -96,6 +101,516 @@ async def send_discord(msg: str):
             await session.post(DISCORD_WEBHOOK_URL, json={"content": msg})
     except Exception as e:
         print(f"⚠️ Discord webhook failed: {e}", flush=True)
+
+# ======================================================
+# ZERO-SIZE TRADE LOGGER
+# ======================================================
+class ZeroSizeTradeLogger:
+    """
+    Logs all zero-size trades for analysis
+    Creates daily CSV and JSON files for pattern recognition
+    """
+    def __init__(self, ticker="SPY"):
+        self.ticker = ticker
+        
+        # Use /tmp for Railway ephemeral storage (files persist during deployment)
+        # Railway resets /tmp on each deploy, which is fine for daily logs
+        self.log_dir = Path("/tmp/zero_size_logs")
+        self.log_dir.mkdir(exist_ok=True)
+        
+        # Create daily log file
+        self.today = datetime.now(ET).strftime('%Y-%m-%d')
+        self.csv_file = self.log_dir / f"zero_trades_{self.ticker}_{self.today}.csv"
+        self.json_file = self.log_dir / f"zero_trades_{self.ticker}_{self.today}.json"
+        
+        # In-memory storage for session
+        self.zero_trades = []
+        
+        # Initialize CSV with headers
+        self.init_csv()
+        
+        print(f"📊 Zero-size logger initialized. Logs: {self.log_dir}", flush=True)
+        
+    def init_csv(self):
+        """Create CSV file with headers if it doesn't exist"""
+        if not self.csv_file.exists():
+            with open(self.csv_file, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    'Timestamp_MS',
+                    'Time_EST',
+                    'Price',
+                    'Size',
+                    'Exchange',
+                    'Exchange_Name',
+                    'Conditions',
+                    'Sequence',
+                    'SIP_Timestamp',
+                    'TRF_Timestamp',
+                    'TRF_ID'
+                ])
+    
+    def log_zero_trade(self, trade_data):
+        """
+        Log a zero-size trade to both CSV and JSON
+        Also print to console for real-time monitoring
+        
+        Args:
+            trade_data: Dictionary with Massive.com trade fields
+        """
+        # Extract Massive.com specific fields
+        timestamp_ms = trade_data.get('sip_timestamp', 0)
+        timestamp_dt = datetime.fromtimestamp(timestamp_ms / 1000, tz=ET)
+        
+        trade_record = {
+            'timestamp_ms': timestamp_ms,
+            'timestamp': timestamp_dt.isoformat(),
+            'time_est': timestamp_dt.strftime('%H:%M:%S.%f')[:-3],
+            'price': trade_data.get('price'),
+            'size': trade_data.get('size'),
+            'exchange': trade_data.get('exchange'),
+            'exchange_name': self.get_exchange_name(trade_data.get('exchange')),
+            'conditions': trade_data.get('conditions', []),
+            'sequence': trade_data.get('sequence'),
+            'sip_timestamp': trade_data.get('sip_timestamp'),
+            'trf_timestamp': trade_data.get('trf_timestamp'),
+            'trf_id': trade_data.get('trf_id')
+        }
+        
+        # Add to in-memory list
+        self.zero_trades.append(trade_record)
+        
+        # Write to CSV
+        self.write_to_csv(trade_record)
+        
+        # Write to JSON (append to array)
+        self.write_to_json(trade_record)
+        
+        # Print to console
+        self.print_zero_trade(trade_record)
+        
+        return trade_record
+    
+    def write_to_csv(self, record):
+        """Append record to CSV file"""
+        with open(self.csv_file, 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                record['timestamp_ms'],
+                record['time_est'],
+                record['price'],
+                record['size'],
+                record['exchange'],
+                record['exchange_name'],
+                '|'.join(str(c) for c in record['conditions']),  # Join conditions with pipe
+                record['sequence'],
+                record['sip_timestamp'],
+                record['trf_timestamp'],
+                record['trf_id']
+            ])
+    
+    def write_to_json(self, record):
+        """Append record to JSON file"""
+        # Read existing data
+        if self.json_file.exists():
+            with open(self.json_file, 'r') as f:
+                try:
+                    data = json.load(f)
+                except json.JSONDecodeError:
+                    data = []
+        else:
+            data = []
+        
+        # Append new record
+        data.append(record)
+        
+        # Write back
+        with open(self.json_file, 'w') as f:
+            json.dump(data, f, indent=2)
+    
+    def print_zero_trade(self, record):
+        """Print zero-size trade to console with formatting"""
+        print(f"\n{'='*80}", flush=True)
+        print(f"🔍 ZERO-SIZE TRADE DETECTED - {self.ticker}", flush=True)
+        print(f"{'='*80}", flush=True)
+        print(f"Time:       {record['time_est']}", flush=True)
+        print(f"Price:      ${record['price']:.2f}", flush=True)
+        print(f"Exchange:   {record['exchange_name']} ({record['exchange']})", flush=True)
+        print(f"Conditions: {', '.join(str(c) for c in record['conditions']) if record['conditions'] else 'None'}", flush=True)
+        print(f"Sequence:   {record['sequence']}", flush=True)
+        print(f"TRF ID:     {record['trf_id']}", flush=True)
+        print(f"{'='*80}\n", flush=True)
+    
+    def get_exchange_name(self, code):
+        """Convert exchange code to readable name"""
+        # Massive.com uses numeric exchange codes
+        exchanges = {
+            1: 'NYSE American',
+            2: 'NASDAQ OMX BX',
+            3: 'NYSE National',
+            4: 'FINRA ADF (Dark Pool)',
+            5: 'Market Independent',
+            6: 'MIAX',
+            7: 'ISE',
+            8: 'EDGA',
+            9: 'EDGX',
+            10: 'LTSE',
+            11: 'Chicago',
+            12: 'NYSE',
+            13: 'NYSE Arca',
+            14: 'NASDAQ',
+            15: 'NASDAQ Small Cap',
+            16: 'NASDAQ Int',
+            17: 'MEMX',
+            18: 'IEX',
+            19: 'CBOE',
+            20: 'NASDAQ PSX',
+            21: 'BATS Y',
+            22: 'BATS'
+        }
+        return exchanges.get(code, f'Unknown ({code})')
+    
+    def get_daily_summary(self):
+        """Generate summary statistics for the day"""
+        if not self.zero_trades:
+            return "No zero-size trades recorded today"
+        
+        # Count by exchange
+        exchange_counts = defaultdict(int)
+        for trade in self.zero_trades:
+            ex = trade['exchange_name']
+            exchange_counts[ex] += 1
+        
+        # Count by price level
+        price_counts = defaultdict(int)
+        for trade in self.zero_trades:
+            price = trade['price']
+            price_counts[price] += 1
+        
+        # Find repeated levels
+        repeated_levels = {p: c for p, c in price_counts.items() if c > 1}
+        
+        # Count by conditions
+        condition_counts = defaultdict(int)
+        for trade in self.zero_trades:
+            for cond in trade['conditions']:
+                condition_counts[cond] += 1
+        
+        summary = f"""
+{'='*80}
+ZERO-SIZE TRADE SUMMARY - {self.ticker} - {self.today}
+{'='*80}
+
+Total Zero-Size Trades: {len(self.zero_trades)}
+
+BY EXCHANGE:
+{self._format_dict(exchange_counts)}
+
+REPEATED PRICE LEVELS (appears more than once):
+{self._format_dict(repeated_levels, prefix='$')}
+
+TOP CONDITIONS:
+{self._format_dict(dict(sorted(condition_counts.items(), key=lambda x: x[1], reverse=True)[:10]))}
+
+Price Range: ${min(t['price'] for t in self.zero_trades):.2f} - ${max(t['price'] for t in self.zero_trades):.2f}
+
+First: {self.zero_trades[0]['time_est']}
+Last:  {self.zero_trades[-1]['time_est']}
+
+Log files saved to:
+CSV:  {self.csv_file}
+JSON: {self.json_file}
+
+{'='*80}
+"""
+        return summary
+    
+    def _format_dict(self, d, prefix=''):
+        """Helper to format dictionary for printing"""
+        if not d:
+            return "  None"
+        return '\n'.join(f"  {prefix}{k}: {v}" for k, v in sorted(d.items(), key=lambda x: x[1], reverse=True))
+    
+    async def save_summary(self):
+        """Save daily summary to file and send to Discord"""
+        summary = self.get_daily_summary()
+        summary_file = self.log_dir / f"summary_{self.ticker}_{self.today}.txt"
+        with open(summary_file, 'w') as f:
+            f.write(summary)
+        print(summary, flush=True)
+        
+        # Send summary to Discord if we have any zero trades
+        if self.zero_trades:
+            discord_msg = f"📊 **Zero-Size Trade Summary - {self.ticker}**\n```\n"
+            discord_msg += f"Total: {len(self.zero_trades)} zero-size trades detected today\n"
+            discord_msg += f"Price Range: ${min(t['price'] for t in self.zero_trades):.2f} - ${max(t['price'] for t in self.zero_trades):.2f}\n"
+            
+            # Show top 3 repeated levels
+            price_counts = defaultdict(int)
+            for trade in self.zero_trades:
+                price_counts[trade['price']] += 1
+            repeated = {p: c for p, c in price_counts.items() if c > 1}
+            
+            if repeated:
+                discord_msg += f"\nRepeated Levels:\n"
+                for price, count in sorted(repeated.items(), key=lambda x: x[1], reverse=True)[:3]:
+                    discord_msg += f"  ${price:.2f}: {count}x\n"
+            
+            discord_msg += "```"
+            await send_discord(discord_msg)
+        
+        return summary_file
+
+# ======================================================
+# DARK POOL TRACKER
+# ======================================================
+class DarkPoolTracker:
+    """
+    Tracks large dark pool prints throughout the day
+    Generates end-of-day summary ranked by notional value
+    """
+    def __init__(self, ticker="SPY", size_threshold=100000):
+        self.ticker = ticker
+        self.size_threshold = size_threshold
+        
+        # Use /tmp for Railway ephemeral storage
+        self.log_dir = Path("/tmp/dark_pool_logs")
+        self.log_dir.mkdir(exist_ok=True)
+        
+        # Create daily log file
+        self.today = datetime.now(ET).strftime('%Y-%m-%d')
+        self.csv_file = self.log_dir / f"dark_pool_{self.ticker}_{self.today}.csv"
+        
+        # In-memory storage for session
+        self.dark_pool_prints = []
+        
+        # Initialize CSV with headers
+        self.init_csv()
+        
+        print(f"🟣 Dark pool tracker initialized. Threshold: {size_threshold:,} shares", flush=True)
+        
+    def init_csv(self):
+        """Create CSV file with headers if it doesn't exist"""
+        if not self.csv_file.exists():
+            with open(self.csv_file, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    'Timestamp_MS',
+                    'Time_EST',
+                    'Price',
+                    'Size',
+                    'Notional_Value',
+                    'Conditions',
+                    'Sequence',
+                    'SIP_Timestamp',
+                    'TRF_Timestamp'
+                ])
+    
+    def log_dark_pool_print(self, trade_data):
+        """
+        Log a large dark pool print
+        
+        Args:
+            trade_data: Dictionary with Massive.com trade fields
+        """
+        timestamp_ms = trade_data.get('sip_timestamp', 0)
+        timestamp_dt = datetime.fromtimestamp(timestamp_ms / 1000, tz=ET)
+        
+        price = trade_data.get('price')
+        size = trade_data.get('size')
+        notional = price * size
+        
+        trade_record = {
+            'timestamp_ms': timestamp_ms,
+            'timestamp': timestamp_dt.isoformat(),
+            'time_est': timestamp_dt.strftime('%H:%M:%S.%f')[:-3],
+            'price': price,
+            'size': size,
+            'notional': notional,
+            'conditions': trade_data.get('conditions', []),
+            'sequence': trade_data.get('sequence'),
+            'sip_timestamp': trade_data.get('sip_timestamp'),
+            'trf_timestamp': trade_data.get('trf_timestamp')
+        }
+        
+        # Add to in-memory list
+        self.dark_pool_prints.append(trade_record)
+        
+        # Write to CSV
+        self.write_to_csv(trade_record)
+        
+        return trade_record
+    
+    def write_to_csv(self, record):
+        """Append record to CSV file"""
+        with open(self.csv_file, 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                record['timestamp_ms'],
+                record['time_est'],
+                record['price'],
+                record['size'],
+                record['notional'],
+                '|'.join(str(c) for c in record['conditions']),
+                record['sequence'],
+                record['sip_timestamp'],
+                record['trf_timestamp']
+            ])
+    
+    def get_daily_summary(self):
+        """
+        Generate end-of-day summary with prints ranked by notional value
+        Returns formatted string for console/Discord
+        """
+        if not self.dark_pool_prints:
+            return "No large dark pool prints recorded today"
+        
+        # Sort by notional value (highest first)
+        sorted_prints = sorted(self.dark_pool_prints, key=lambda x: x['notional'], reverse=True)
+        
+        # Calculate statistics
+        total_prints = len(sorted_prints)
+        total_volume = sum(p['size'] for p in sorted_prints)
+        total_notional = sum(p['notional'] for p in sorted_prints)
+        avg_size = total_volume / total_prints
+        avg_notional = total_notional / total_prints
+        
+        # Group by price level to find repeated levels
+        price_groups = defaultdict(list)
+        for p in sorted_prints:
+            price_groups[p['price']].append(p)
+        
+        # Build summary text
+        summary = f"""
+{'='*100}
+LARGE DARK POOL PRINTS SUMMARY - {self.ticker} - {self.today}
+{'='*100}
+
+STATISTICS:
+  Total Prints:        {total_prints}
+  Total Volume:        {total_volume:,} shares
+  Total Notional:      ${total_notional:,.2f}
+  Average Size:        {avg_size:,.0f} shares
+  Average Notional:    ${avg_notional:,.2f}
+  Size Threshold:      {self.size_threshold:,} shares
+
+{'='*100}
+TOP PRINTS BY NOTIONAL VALUE
+{'='*100}
+{'Rank':<6} {'Time':<12} {'Price':<10} {'Size':<15} {'Notional':<18} {'Conditions':<20}
+{'-'*100}
+"""
+        
+        # Add top prints (up to 50)
+        for i, p in enumerate(sorted_prints[:50], 1):
+            conditions_str = ','.join(str(c) for c in p['conditions'][:5])  # First 5 conditions
+            if len(p['conditions']) > 5:
+                conditions_str += '...'
+            
+            summary += f"{i:<6} {p['time_est']:<12} ${p['price']:<9.2f} {p['size']:>14,} ${p['notional']:>17,.2f} {conditions_str:<20}\n"
+        
+        if len(sorted_prints) > 50:
+            summary += f"\n... and {len(sorted_prints) - 50} more prints\n"
+        
+        # Add price level analysis
+        repeated_levels = {price: trades for price, trades in price_groups.items() if len(trades) > 1}
+        
+        if repeated_levels:
+            summary += f"\n{'='*100}\n"
+            summary += "REPEATED PRICE LEVELS (Multiple large prints at same price)\n"
+            summary += f"{'='*100}\n"
+            summary += f"{'Price':<10} {'Count':<8} {'Total Size':<18} {'Total Notional':<20}\n"
+            summary += f"{'-'*100}\n"
+            
+            # Sort by total notional at that level
+            level_summary = []
+            for price, trades in repeated_levels.items():
+                total_size = sum(t['size'] for t in trades)
+                total_not = sum(t['notional'] for t in trades)
+                level_summary.append((price, len(trades), total_size, total_not))
+            
+            level_summary.sort(key=lambda x: x[3], reverse=True)  # Sort by total notional
+            
+            for price, count, total_size, total_not in level_summary[:20]:
+                summary += f"${price:<9.2f} {count:<8} {total_size:>17,} ${total_not:>19,.2f}\n"
+        
+        summary += f"\n{'='*100}\n"
+        summary += f"Log file saved to: {self.csv_file}\n"
+        summary += f"{'='*100}\n"
+        
+        return summary
+    
+    def get_discord_summary(self):
+        """
+        Generate Discord-friendly summary (shorter, formatted for Discord)
+        """
+        if not self.dark_pool_prints:
+            return None
+        
+        sorted_prints = sorted(self.dark_pool_prints, key=lambda x: x['notional'], reverse=True)
+        
+        total_prints = len(sorted_prints)
+        total_volume = sum(p['size'] for p in sorted_prints)
+        total_notional = sum(p['notional'] for p in sorted_prints)
+        
+        # Build Discord message
+        msg = f"🟣 **Large Dark Pool Prints Summary - {self.ticker}**\n"
+        msg += f"**{self.today}**\n\n"
+        msg += f"**Statistics:**\n"
+        msg += f"• Total Prints: **{total_prints}**\n"
+        msg += f"• Total Volume: **{total_volume:,} shares**\n"
+        msg += f"• Total Notional: **${total_notional:,.2f}**\n\n"
+        
+        msg += f"**Top 10 by Notional Value:**\n```\n"
+        msg += f"{'#':<3} {'Time':<9} {'Price':<8} {'Size':<12} {'Notional':<15}\n"
+        msg += f"{'-'*50}\n"
+        
+        for i, p in enumerate(sorted_prints[:10], 1):
+            msg += f"{i:<3} {p['time_est'][:8]:<9} ${p['price']:<7.2f} {p['size']:>11,} ${p['notional']:>14,.0f}\n"
+        
+        msg += "```\n"
+        
+        # Add repeated levels if any
+        price_groups = defaultdict(list)
+        for p in sorted_prints:
+            price_groups[p['price']].append(p)
+        
+        repeated_levels = {price: trades for price, trades in price_groups.items() if len(trades) > 1}
+        
+        if repeated_levels:
+            msg += f"\n**Repeated Price Levels:**\n```\n"
+            level_summary = []
+            for price, trades in repeated_levels.items():
+                total_size = sum(t['size'] for t in trades)
+                total_not = sum(t['notional'] for t in trades)
+                level_summary.append((price, len(trades), total_size, total_not))
+            
+            level_summary.sort(key=lambda x: x[3], reverse=True)
+            
+            msg += f"{'Price':<8} {'Count':<6} {'Total Notional':<15}\n"
+            msg += f"{'-'*35}\n"
+            
+            for price, count, total_size, total_not in level_summary[:5]:
+                msg += f"${price:<7.2f} {count:<6} ${total_not:>14,.0f}\n"
+            
+            msg += "```"
+        
+        return msg
+    
+    async def save_summary(self):
+        """Save daily summary to file and send to Discord"""
+        summary = self.get_daily_summary()
+        summary_file = self.log_dir / f"summary_dark_pool_{self.ticker}_{self.today}.txt"
+        with open(summary_file, 'w') as f:
+            f.write(summary)
+        print(summary, flush=True)
+        
+        # Send to Discord
+        discord_msg = self.get_discord_summary()
+        if discord_msg:
+            await send_discord(discord_msg)
+        
+        return summary_file
 
 # ======================================================
 # VELOCITY DIVERGENCE TRACKING
@@ -367,6 +882,18 @@ async def run():
     # Connect to Postgres
     db = await init_postgres()
     
+    # Initialize zero-size trade logger
+    zero_logger = None
+    if ZERO_SIZE_LOGGING_ENABLED:
+        zero_logger = ZeroSizeTradeLogger(SYMBOL)
+        print("✅ Zero-size trade logging ENABLED", flush=True)
+    else:
+        print("⏸️ Zero-size trade logging DISABLED", flush=True)
+    
+    # Initialize dark pool tracker
+    dark_pool_tracker = DarkPoolTracker(SYMBOL, DARK_POOL_SIZE_THRESHOLD)
+    print("✅ Dark pool tracker ENABLED", flush=True)
+    
     # Session ranges
     today_low = None
     today_high = None
@@ -390,6 +917,10 @@ async def run():
     # Tracking for initial range establishment
     initial_trades_count = 0
     INITIAL_TRADES_THRESHOLD = 100  # Wait for 100 trades before enabling phantom detection
+    
+    # Track last summary generation time (generate once at end of day)
+    last_summary_date = None
+    summary_generated_today = False
     
     while True:
         try:
@@ -437,6 +968,50 @@ async def run():
                             print(f"TRADE {price} size={size} cond={conds} exch={exch}")
 
                         tm = datetime.fromtimestamp(sip_ts_raw/1000, tz=ET).time()
+
+                        # ====================================================================
+                        # END-OF-DAY SUMMARY GENERATION
+                        # Generate summary once after market close
+                        # ====================================================================
+                        current_date = datetime.now(ET).date()
+                        is_after_close = tm >= time(20, 0)  # After 8 PM ET
+                        
+                        if is_after_close and not summary_generated_today and (last_summary_date is None or last_summary_date < current_date):
+                            
+                            # Generate zero-size summary
+                            if zero_logger and zero_logger.zero_trades:
+                                print("🕐 Market closed. Generating zero-size trade summary...", flush=True)
+                                await zero_logger.save_summary()
+                            
+                            # Generate dark pool summary
+                            if dark_pool_tracker.dark_pool_prints:
+                                print("🕐 Market closed. Generating dark pool summary...", flush=True)
+                                await dark_pool_tracker.save_summary()
+                            
+                            summary_generated_today = True
+                            last_summary_date = current_date
+                        
+                        # Reset flag for new day
+                        if last_summary_date is not None and current_date > last_summary_date:
+                            summary_generated_today = False
+
+                        # ====================================================================
+                        # ZERO-SIZE TRADE DETECTION
+                        # Check for zero-size trades and log them for pattern analysis
+                        # ====================================================================
+                        if zero_logger and size == 0:
+                            # Build trade data dict for logger
+                            zero_trade_data = {
+                                'price': price,
+                                'size': size,
+                                'exchange': exch,
+                                'conditions': conds,
+                                'sequence': sequence,
+                                'sip_timestamp': sip_ts_raw,
+                                'trf_timestamp': trf_ts_raw,
+                                'trf_id': trf_id
+                            }
+                            zero_logger.log_zero_trade(zero_trade_data)
 
                         # Update session-specific categories FIRST (needed for categorization)
                         in_premarket = time(4, 0) <= tm < time(9, 30)
@@ -653,13 +1228,25 @@ async def run():
                         # Dark pool large print detection
                         is_darkpool = (exch == 4)  # Exchange 4 is dark pool
                         if is_darkpool and size >= DARK_POOL_SIZE_THRESHOLD and not bad_conditions:
+                            # Log to tracker for end-of-day summary
+                            dp_trade_data = {
+                                'price': price,
+                                'size': size,
+                                'conditions': conds,
+                                'sequence': sequence,
+                                'sip_timestamp': sip_ts_raw,
+                                'trf_timestamp': trf_ts_raw
+                            }
+                            dark_pool_tracker.log_dark_pool_print(dp_trade_data)
+                            
+                            # Print to console
                             print(
                                 f"🟣 LARGE DARK POOL PRINT {ts_str()} ${price} "
-                                f"size={size:,} conds={conds} seq={sequence}",
+                                f"size={size:,} notional=${price * size:,.2f} conds={conds} seq={sequence}",
                                 flush=True
                             )
                             
-                            # Send to Discord
+                            # Send immediate alert to Discord
                             dp_msg = (
                                 f"🟣 **Large Dark Pool Print**\n"
                                 f"Price: **${price}**\n"
@@ -687,16 +1274,62 @@ async def run():
                                     
         except websockets.exceptions.ConnectionClosed as e:
             print(f"⚠️ Websocket closed: {e}", flush=True)
+            # Generate summaries if data exists
+            if zero_logger and zero_logger.zero_trades:
+                print("📊 Generating zero-size trade summary before reconnecting...", flush=True)
+                await zero_logger.save_summary()
+            if dark_pool_tracker.dark_pool_prints:
+                print("📊 Generating dark pool summary before reconnecting...", flush=True)
+                await dark_pool_tracker.save_summary()
             print("🔁 Reconnecting in 5 seconds...", flush=True)
             await asyncio.sleep(5)
         except Exception as e:
             print(f"⚠️ Unexpected error: {e}", flush=True)
             import traceback
             traceback.print_exc()
+            # Generate summaries if data exists
+            if zero_logger and zero_logger.zero_trades:
+                print("📊 Generating zero-size trade summary before reconnecting...", flush=True)
+                await zero_logger.save_summary()
+            if dark_pool_tracker.dark_pool_prints:
+                print("📊 Generating dark pool summary before reconnecting...", flush=True)
+                await dark_pool_tracker.save_summary()
             print("🔁 Reconnecting in 5 seconds...", flush=True)
             await asyncio.sleep(5)
 
 if __name__ == "__main__":
+    import signal
+    
+    # Global references for signal handler
+    global_zero_logger = None
+    global_dark_pool_tracker = None
+    
+    def signal_handler(signum, frame):
+        """Handle shutdown signals and generate final summaries"""
+        print("\n\n🛑 Shutdown signal received. Generating final summaries...", flush=True)
+        
+        # Zero-size summary
+        if global_zero_logger and global_zero_logger.zero_trades:
+            summary = global_zero_logger.get_daily_summary()
+            summary_file = global_zero_logger.log_dir / f"summary_{global_zero_logger.ticker}_{global_zero_logger.today}.txt"
+            with open(summary_file, 'w') as f:
+                f.write(summary)
+            print(summary, flush=True)
+        
+        # Dark pool summary
+        if global_dark_pool_tracker and global_dark_pool_tracker.dark_pool_prints:
+            summary = global_dark_pool_tracker.get_daily_summary()
+            summary_file = global_dark_pool_tracker.log_dir / f"summary_dark_pool_{global_dark_pool_tracker.ticker}_{global_dark_pool_tracker.today}.txt"
+            with open(summary_file, 'w') as f:
+                f.write(summary)
+            print(summary, flush=True)
+        
+        exit(0)
+    
+    # Register signal handlers
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
     try:
         asyncio.run(run())
     except Exception as e:
